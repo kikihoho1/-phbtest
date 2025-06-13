@@ -10,9 +10,11 @@ import json
 import logging
 import os
 import sys
-from collections import defaultdict
-from dataclasses import dataclass, asdict, field
+from collections import Counter, defaultdict
+import math
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+import re
 
 from dotenv import load_dotenv
 
@@ -42,6 +44,23 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 TOP_K_SEARCH = 20
 TOP_K_RERANK = 5
+
+# 간단한 속어/비격식 → 공식 용어 매핑
+SYNONYM_MAP: Dict[str, str] = {
+    "투잡": "겸직",
+    "겹치기": "겸직",
+    "성매매": "성매매",  # 동의어 예시 보존
+    "뇌물": "금품수수",
+}
+
+def rewrite_query(text: str) -> str:
+    out = text
+    for k, v in SYNONYM_MAP.items():
+        out = out.replace(k, v)
+    return out
+
+def tokenize(text: str) -> List[str]:
+    return [t for t in re.findall(r"[\w]+", text.lower()) if t]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -89,6 +108,42 @@ class VectorSearch:
         faiss.normalize_L2(emb)
         scores, idxs = self.idx.search(emb, k)
         return [(int(i), float(s)) for i, s in zip(idxs[0], scores[0]) if i != -1]
+
+
+class BM25Search:
+    """매우 단순한 BM25 구현"""
+
+    def __init__(self, docs: List[str], k1: float = 1.5, b: float = 0.75) -> None:
+        self.k1 = k1
+        self.b = b
+        self.docs_len = []
+        self.term_freqs: List[Counter] = []
+        df: Counter = Counter()
+        for text in docs:
+            tokens = tokenize(text)
+            tf = Counter(tokens)
+            self.term_freqs.append(tf)
+            self.docs_len.append(len(tokens))
+            df.update(tf.keys())
+        self.avgdl = sum(self.docs_len) / max(1, len(self.docs_len))
+        self.idf = {t: math.log((len(self.term_freqs) - df[t] + 0.5) / (df[t] + 0.5) + 1) for t in df}
+
+    def search(self, query: str, k: int = TOP_K_SEARCH) -> List[int]:
+        q_tokens = tokenize(query)
+        scores = []
+        for idx, tf in enumerate(self.term_freqs):
+            score = 0.0
+            dl = self.docs_len[idx]
+            for t in q_tokens:
+                if t not in tf:
+                    continue
+                idf = self.idf.get(t, 0.0)
+                freq = tf[t]
+                denom = freq + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                score += idf * (freq * (self.k1 + 1) / denom)
+            scores.append((idx, score))
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return [idx for idx, _ in scores[:k]]
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -167,6 +222,7 @@ class LegalRAG:
         ]
 
         self.searcher = VectorSearch(FAISS_INDEX_PATH)
+        self.bm25 = BM25Search([a.content for a in self.articles])
         self.reranker = CrossReranker()
         self.generator = AnswerGenerator()
 
@@ -187,8 +243,15 @@ class LegalRAG:
         return list(out.values())
 
     def ask(self, question: str) -> str:
-        idxs = [idx for idx, _ in self.searcher.search(question, TOP_K_SEARCH)]
-        idxs = self.reranker.rerank(question, self.articles, idxs)
+        rewritten = rewrite_query(question)
+        v_idxs = [idx for idx, _ in self.searcher.search(rewritten, TOP_K_SEARCH)]
+        b_idxs = self.bm25.search(rewritten, TOP_K_SEARCH)
+        # 벡터 + BM25 결과 병합 (중복 제거, 순서 유지)
+        idxs = []
+        for i in v_idxs + b_idxs:
+            if i not in idxs:
+                idxs.append(i)
+        idxs = self.reranker.rerank(rewritten, self.articles, idxs)
         answer_articles = self._expand([self.articles[i] for i in idxs])
         return self.generator.generate(question, answer_articles)
 
