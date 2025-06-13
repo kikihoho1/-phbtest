@@ -31,6 +31,20 @@ ARTICLES_DATA_PATH = "company_rules.json"
 EMBEDDING_MODEL_NAME = "jhgan/ko-sroberta-multitask"
 BATCH_SIZE = 32
 
+# 질의/문서 정규화를 위한 간단한 동의어 매핑
+SYNONYM_MAP: Dict[str, str] = {
+    "투잡": "겸직",
+    "겹치기": "겸직",
+    "뇌물": "금품수수",
+}
+
+def normalize(text: str) -> str:
+    """임베딩 계산 전 텍스트 정규화"""
+    for k, v in SYNONYM_MAP.items():
+        text = text.replace(k, v)
+    text = re.sub(r"[\s]+", " ", text)
+    return text.strip()
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 로깅
 # ────────────────────────────────────────────────────────────────────────────────
@@ -284,9 +298,12 @@ class LegalDocumentIndexer:
         if not self.articles:
             raise RuntimeError("추출된 조문이 없습니다.")
 
+        for a in self.articles:
+            a.content = normalize(a.content)
+
         # 2) 임베딩
         embeddings = self.model.encode(
-            [a.content for a in self.articles],
+            [normalize(a.content) for a in self.articles],
             batch_size=BATCH_SIZE,
             convert_to_numpy=True,
             show_progress_bar=True,
